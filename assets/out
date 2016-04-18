@@ -1,77 +1,82 @@
-#!/bin/sh
-# vim: set ft=sh
+#!/usr/bin/env python3
 
-set -e
-test -z $DEBUG || set -x
+import logging as log
+import re
+import subprocess
+import sys
+from resource import Resource
 
-exec 3>&1 # make stdout available as fd 3 for the result
-exec 1>&2 # redirect all output to stderr for logging
 
-source=$1
+def human_readable_output(line):
+    """Convert packer machine readable output to human readable output."""
+    if not line:
+        return None
+    ts, target, out_type, data = line.split(',', 3)
+    if out_type == 'ui':
+        ui_type, output = data.split(',', 1)
+        return output.replace('%!(PACKER_COMMA)', ',')
+    else:
+        return None
 
-if [ -z "$source" ]; then
-  echo "usage: $0 <path/to/source>"
-  exit 1
-fi
+class PackerResource(Resource):
+    """Resource implementation for packer."""
 
-payload=$(mktemp /tmp/resource-out.XXXXXX)
+    def out_cmd(self, source, params):
+        """Packer build."""
 
-cat > $payload <&0
-test -z $DEBUG || cat $payload
+        template_path = params['template_path']
+        build_vars = params.get('build_vars', {})
+        build_vars_from_file = params.get('build_vars_from_file', {})
 
-cd $source
+        # read build var values from files
+        for k, build_var_file in build_vars_from_file.items():
+            with open(build_var_file) as f:
+                build_vars[k] = f.read().strip()
 
-export AWS_DEFAULT_REGION=$(cat $payload|jq -r '.params.region // .source.region')
+        # compose packer command
+        cmd = ['packer', 'build', '-machine-readable']
+        for k, v in build_vars.items():
+            cmd += ['-var=%s=%s' % (k, v)]
+        cmd.append(template_path)
 
-instance_id_file="$(cat $payload|jq -r '.params.instance_id_file // .source.instance_id_file // "ami-id/id" ')"
-name="$(cat $payload|jq -r '.params.name // .source.name')"
-description="$(cat $payload|jq -r '.params.name // .source.name // "Created by concourse-aws-ami-resource"')"
-terminate="$(cat $payload|jq -r '.params.terminate == true')"
+        log.info('starting packer build')
+        proc = subprocess.Popen(cmd, stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE, universal_newlines=True)
+        output = ""
+        for line in proc.stdout:
+            if not line or not line.strip():
+                continue
+            output += line
+            log.info(human_readable_output(line.strip()))
 
-if [ -z "$name" ]; then
-  echo "no name specified" >&2
-  exit 1
-fi
+        # set exitcode
+        proc.wait()
+        if proc.returncode != 0:
+            log.error('packer build failed.')
+            sys.exit(1)
+        log.info('packer build completed.')
 
-if ! test -f "$instance_id_file"; then
-  echo "instance id file ${instance_id_file} not found in $(pwd)" >&2
-  exit 1
-fi
+        AMI_MATCH = 'artifact,0,id,(?P<region>[\w-]+):(?P<ami_id>[\w-]+)'
+        version_match = re.search(AMI_MATCH, output, re.DOTALL)
+        if not version_match:
+            raise Exception('no AMI id in output')
+        region, ami_id = version_match.groups()
 
-instance_id=$(cat $instance_id_file)
+        metadata = []
 
-if [ -z "$instance_id" ]; then
-  echo "instance_id_file ${instance_id_file} empty" >&2
-  exit 1
-fi
+        TAG_MATCH = 'Adding tag: "(?P<name>[^"]+)": "(?P<value>[^"]*)"'
+        for tag in re.finditer(TAG_MATCH, output, re.DOTALL):
+            meta_tag = tag.groupdict()
+            meta_tag['name'] = 'tag_' + meta_tag['name']
+            metadata.append(meta_tag)
 
-# if instance is just shutting down wait to complete otherwise create image fails
-stopping=$(aws ec2 describe-instance-status --instance-ids "$instance_id" | \
-    jq -e '.InstanceStatuses[0]|.InstanceState|.Name == "stopping"')
+        return {
+            'version': {
+                'ImageId': ami_id,
+                'Region': region,
+            },
+            'metadata': metadata,
+        }
 
-if [ "$state" == "true" ];then
-    aws ec2 wait instance-stopped --instance-ids "$instance_id"
-fi
-
-# give command to create image
-response=$(aws ec2 create-image --instance-id "$instance_id" --name "$name" --description "$description")
-
-# get the ID
-ami_id=$(echo $response|jq -r '.ImageId')
-
-# wait for image to be available
-aws ec2 wait image-available --image-ids "$ami_id"
-
-# get some metadata
-metadata=$(aws ec2 describe-images --image-ids "$ami_id" | \
-    jq -r '.Images[0]|{Name,CreationDate,OwnerId}|to_entries|map({"name":.key, "value":.value})')
-
-# terminate instance if requested
-if $terminate;then
-    aws ec2 terminate-instances --instance-ids "$instance_id"
-fi
-
-jq -n "{
-  version: ${response},
-  metadata: ${metadata}
-}" >&3
+if __name__ == '__main__':
+    print(PackerResource().run('out'))

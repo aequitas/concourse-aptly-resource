@@ -1,19 +1,28 @@
-FROM alpine:latest
+FROM python:3-alpine
 
-RUN \
-	apk -Uuv add jq openssl bzip2 ca-certificates gnupg && \
-	rm /var/cache/apk/*
+# add aptly dependencies
+RUN apk -Uuv add openssl bzip2 ca-certificates gnupg && \
+  rm /var/cache/apk/*
 
-RUN wget -qO- https://bintray.com/artifact/download/smira/aptly/aptly_0.9.6_linux_amd64.tar.gz | tar -zx
-RUN mv aptly_0.9.6_linux_amd64/aptly /usr/local/bin/
+# install aptly
+RUN wget -qO- https://bintray.com/artifact/download/smira/aptly/aptly_0.9.6_linux_amd64.tar.gz | tar -zx \
+  mv aptly_0.9.6_linux_amd64/aptly /usr/local/bin/
 
-# for jq
-ENV PATH=/usr/local/bin:$PATH
+# install python requirements
+ADD requirements*.txt setup.cfg /tmp/
+WORKDIR /tmp/
+RUN pip --disable-pip-version-check install --no-cache-dir -r requirements.txt
 
-# install asserts
+# install utils
+ADD scripts/* /tmp/
+RUN /tmp/install_test.sh
+
+# install tests
+ADD tests/ /opt/tests/
+
+# install resource assets
 ADD assets/ /opt/resource/
-RUN chmod +x /opt/resource/*
 
-# test
-ADD tests/ /opt/test-resource/
-RUN set -ve; /opt/test-resource/tests.sh
+# test and cleanup
+RUN /tmp/test.sh
+RUN /tmp/cleanup_test.sh
